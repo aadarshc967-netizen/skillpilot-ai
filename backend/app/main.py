@@ -11,6 +11,7 @@ from typing import Annotated, Any
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from .agents import (
     ASSESSMENT_QUESTIONS,
@@ -19,17 +20,22 @@ from .agents import (
     AgentProviderError,
     MentorAgent,
 )
+from .auth import create_access_token, decode_access_token, hash_password, verify_password
 from .database import get_connection, get_db, initialize_database
 from .schemas import (
     AnalysisRequest,
+    AuthResponse,
     AssessmentAttempt,
     AssessmentSubmission,
-    LearnerProfileUpdate,
     CareerUpdate,
     Learner,
+    LearnerProfileUpdate,
+    LoginRequest,
     MentorMessage,
     RoadmapStep,
+    SignupRequest,
     Skill,
+    SkillCreate,
     SkillProgressUpdate,
 )
 
@@ -49,14 +55,38 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "https://skillpilot-ai-mocha.vercel.app",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 Database = Annotated[sqlite3.Connection, Depends(get_db)]
+bearer_scheme = HTTPBearer(auto_error=False)
 logger = logging.getLogger(__name__)
+
+
+def get_current_learner(
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)],
+    db: Database,
+) -> sqlite3.Row:
+    claims = decode_access_token(credentials.credentials) if credentials else None
+    if claims is None:
+        raise HTTPException(status_code=401, detail="A valid bearer token is required")
+    learner = db.execute(
+        "SELECT * FROM learners WHERE id = ? AND password_hash IS NOT NULL",
+        (int(claims["sub"]),),
+    ).fetchone()
+    if learner is None:
+        raise HTTPException(status_code=401, detail="Account is not available")
+    return learner
+
+
+CurrentLearner = Annotated[sqlite3.Row, Depends(get_current_learner)]
 
 
 @app.get("/api/health")
@@ -65,86 +95,139 @@ def health() -> dict[str, str]:
     return {"status": "ok", "ai_mode": orchestrator.mode}
 
 
+@app.post("/api/auth/signup", response_model=AuthResponse, status_code=201)
+def signup(payload: SignupRequest, db: Database) -> dict[str, Any]:
+    name = payload.name.strip()
+    email = payload.email.strip().casefold()
+    if not name or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise HTTPException(status_code=422, detail="Enter a name and valid email address")
+    if db.execute(
+        "SELECT 1 FROM learners WHERE lower(email) = ?",
+        (email,),
+    ).fetchone():
+        raise HTTPException(status_code=409, detail="An account with this email already exists")
+    cursor = db.execute(
+        """
+        INSERT INTO learners (name, email, target_career, password_hash)
+        VALUES (?, ?, '', ?)
+        """,
+        (name, email, hash_password(payload.password)),
+    )
+    db.commit()
+    learner = db.execute("SELECT * FROM learners WHERE id = ?", (cursor.lastrowid,)).fetchone()
+    return {"access_token": create_access_token(learner["id"]), "learner": _learner_response(learner)}
+
+
+@app.post("/api/auth/login", response_model=AuthResponse)
+def login(payload: LoginRequest, db: Database) -> dict[str, Any]:
+    email = payload.email.strip().casefold()
+    learner = db.execute(
+        "SELECT * FROM learners WHERE lower(email) = ? AND password_hash IS NOT NULL",
+        (email,),
+    ).fetchone()
+    if learner is None or not verify_password(payload.password, learner["password_hash"]):
+        raise HTTPException(status_code=401, detail="Email or password is incorrect")
+    return {"access_token": create_access_token(learner["id"]), "learner": _learner_response(learner)}
+
+
 @app.get("/api/learner", response_model=Learner)
-def get_learner(db: Database) -> dict[str, object]:
-    learner = db.execute("SELECT * FROM learners WHERE id = 1").fetchone()
-    if learner is None:
-        raise HTTPException(status_code=404, detail="Learner not found")
+def get_learner(learner: CurrentLearner) -> dict[str, object]:
     return _learner_response(learner)
 
 
 @app.put("/api/learner/career", response_model=Learner)
-def update_career(payload: CareerUpdate, db: Database) -> dict[str, object]:
+def update_career(payload: CareerUpdate, db: Database, learner: CurrentLearner) -> dict[str, object]:
     career = payload.target_career.strip()
-    if not career:
-        raise HTTPException(status_code=422, detail="Target career cannot be empty")
-    if career not in CAREER_REQUIREMENTS:
+    if career and career not in CAREER_REQUIREMENTS:
         raise HTTPException(status_code=422, detail="Select a supported target career")
     result = db.execute(
-        "UPDATE learners SET target_career = ? WHERE id = 1",
-        (career,),
+        "UPDATE learners SET target_career = ? WHERE id = ?",
+        (career, learner["id"]),
     )
-    if result.rowcount == 0:
-        raise HTTPException(status_code=404, detail="Learner not found")
-    db.execute(
-        "UPDATE skills SET is_gap = 0, priority = '—' WHERE learner_id = 1"
-    )
-    existing_skills = {
-        row["name"].casefold(): row
-        for row in db.execute(
-            "SELECT id, name, category, progress FROM skills WHERE learner_id = 1"
-        ).fetchall()
-    }
-    for requirement in CAREER_REQUIREMENTS[career]:
-        existing = existing_skills.get(requirement["name"].casefold())
-        if existing is None:
-            db.execute(
-                """
-                INSERT INTO skills
-                    (learner_id, name, category, level, progress, is_gap, priority)
-                VALUES (1, ?, ?, 'Not started', 0, 1, ?)
-                """,
-                (requirement["name"], requirement["category"], requirement["priority"]),
-            )
-            continue
-        is_gap = existing["progress"] < requirement["minimum_progress"]
-        priority = requirement["priority"] if is_gap else "—"
+    if career != learner["target_career"]:
+        db.execute("DELETE FROM roadmap_steps WHERE learner_id = ?", (learner["id"],))
         db.execute(
-            "UPDATE skills SET is_gap = ?, priority = ? WHERE id = ?",
-            (int(is_gap), priority, existing["id"]),
+            "UPDATE skills SET is_gap = 0, priority = '—' WHERE learner_id = ?",
+            (learner["id"],),
         )
     db.commit()
-    return _learner_response(db.execute("SELECT * FROM learners WHERE id = 1").fetchone())
+    return _learner_response(db.execute("SELECT * FROM learners WHERE id = ?", (learner["id"],)).fetchone())
 
 
 @app.put("/api/learner/profile", response_model=Learner)
-def update_learner_profile(payload: LearnerProfileUpdate, db: Database) -> dict[str, object]:
+def update_learner_profile(
+    payload: LearnerProfileUpdate,
+    db: Database,
+    learner: CurrentLearner,
+) -> dict[str, object]:
     name = payload.name.strip()
     email = payload.email.strip()
     certifications = [item.strip() for item in payload.certifications if item.strip()]
     projects = [item.strip() for item in payload.projects if item.strip()]
     if not name or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
         raise HTTPException(status_code=422, detail="Enter a learner name and valid email address")
+    duplicate = db.execute(
+        "SELECT 1 FROM learners WHERE lower(email) = ? AND id != ?",
+        (email.casefold(), learner["id"]),
+    ).fetchone()
+    if duplicate:
+        raise HTTPException(status_code=409, detail="An account with this email already exists")
     result = db.execute(
         """
         UPDATE learners
-        SET name = ?, email = ?, certifications_json = ?, projects_json = ?
-        WHERE id = 1
+        SET name = ?, email = ?, education = ?, academic_level = ?, institution = ?,
+            experience = ?, certifications_json = ?, projects_json = ?
+        WHERE id = ?
         """,
-        (name, email, json.dumps(certifications), json.dumps(projects)),
+        (
+            name,
+            email.casefold(),
+            payload.education.strip(),
+            payload.academic_level.strip(),
+            payload.institution.strip(),
+            payload.experience.strip(),
+            json.dumps(certifications),
+            json.dumps(projects),
+            learner["id"],
+        ),
     )
     if result.rowcount == 0:
         raise HTTPException(status_code=404, detail="Learner not found")
     db.commit()
-    return _learner_response(db.execute("SELECT * FROM learners WHERE id = 1").fetchone())
+    return _learner_response(db.execute("SELECT * FROM learners WHERE id = ?", (learner["id"],)).fetchone())
 
 
 @app.get("/api/skills", response_model=list[Skill])
-def get_skills(db: Database) -> list[dict[str, object]]:
+def get_skills(db: Database, learner: CurrentLearner) -> list[dict[str, object]]:
     rows = db.execute(
-        "SELECT * FROM skills WHERE learner_id = 1 ORDER BY is_gap, id"
+        "SELECT * FROM skills WHERE learner_id = ? ORDER BY is_gap, id",
+        (learner["id"],),
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+@app.post("/api/skills", response_model=Skill, status_code=201)
+def create_skill(payload: SkillCreate, db: Database, learner: CurrentLearner) -> dict[str, Any]:
+    name = payload.name.strip()
+    category = payload.category.strip()
+    if not name or not category:
+        raise HTTPException(status_code=422, detail="Skill name and category are required")
+    duplicate = db.execute(
+        "SELECT 1 FROM skills WHERE learner_id = ? AND lower(name) = lower(?)",
+        (learner["id"], name),
+    ).fetchone()
+    if duplicate:
+        raise HTTPException(status_code=409, detail="This skill is already in your profile")
+    level = _skill_level(payload.progress)
+    cursor = db.execute(
+        """
+        INSERT INTO skills (learner_id, name, category, level, progress, is_gap, priority)
+        VALUES (?, ?, ?, ?, ?, 0, '—')
+        """,
+        (learner["id"], name, category, level, payload.progress),
+    )
+    db.commit()
+    return dict(db.execute("SELECT * FROM skills WHERE id = ?", (cursor.lastrowid,)).fetchone())
 
 
 @app.put("/api/skills/{skill_id}", response_model=Skill)
@@ -152,53 +235,63 @@ def update_skill_progress(
     skill_id: int,
     payload: SkillProgressUpdate,
     db: Database,
+    learner: CurrentLearner,
 ) -> dict[str, object]:
     skill = db.execute(
-        "SELECT * FROM skills WHERE id = ? AND learner_id = 1",
-        (skill_id,),
+        "SELECT * FROM skills WHERE id = ? AND learner_id = ?",
+        (skill_id, learner["id"]),
     ).fetchone()
     if skill is None:
         raise HTTPException(status_code=404, detail="Skill not found")
-    profile = db.execute("SELECT target_career FROM learners WHERE id = 1").fetchone()
+    profile = db.execute("SELECT target_career FROM learners WHERE id = ?", (learner["id"],)).fetchone()
     requirements = {
         item["name"].casefold(): item
-        for item in CAREER_REQUIREMENTS[profile["target_career"]]
+        for item in CAREER_REQUIREMENTS.get(profile["target_career"], [])
     }
     requirement = requirements.get(skill["name"].casefold())
     is_gap = bool(requirement and payload.progress < requirement["minimum_progress"])
     priority = requirement["priority"] if is_gap and requirement else "—"
-    level = (
-        "Not started" if payload.progress == 0
-        else "Beginner" if payload.progress < 40
-        else "Intermediate" if payload.progress < 75
-        else "Advanced"
-    )
+    level = _skill_level(payload.progress)
     db.execute(
-        "UPDATE skills SET progress = ?, level = ?, is_gap = ?, priority = ? WHERE id = ?",
-        (payload.progress, level, int(is_gap), priority, skill_id),
+        """
+        UPDATE skills SET progress = ?, level = ?, is_gap = ?, priority = ?
+        WHERE id = ? AND learner_id = ?
+        """,
+        (payload.progress, level, int(is_gap), priority, skill_id, learner["id"]),
     )
     db.commit()
-    updated = db.execute("SELECT * FROM skills WHERE id = ?", (skill_id,)).fetchone()
+    updated = db.execute(
+        "SELECT * FROM skills WHERE id = ? AND learner_id = ?",
+        (skill_id, learner["id"]),
+    ).fetchone()
     return dict(updated)
 
 
 @app.get("/api/roadmap", response_model=list[RoadmapStep])
-def get_roadmap(db: Database) -> list[dict[str, Any]]:
-    return _load_roadmap(db)
+def get_roadmap(db: Database, learner: CurrentLearner) -> list[dict[str, Any]]:
+    return _load_roadmap(db, learner["id"])
 
 
 @app.put("/api/roadmap/{step_id}", response_model=RoadmapStep)
-def update_roadmap_step(step_id: int, status: str, db: Database) -> dict[str, Any]:
+def update_roadmap_step(
+    step_id: int,
+    status: str,
+    db: Database,
+    learner: CurrentLearner,
+) -> dict[str, Any]:
     if status not in {"complete", "in-progress", "up-next", "locked"}:
         raise HTTPException(status_code=422, detail="Unsupported roadmap status")
     result = db.execute(
-        "UPDATE roadmap_steps SET status = ? WHERE id = ? AND learner_id = 1",
-        (status, step_id),
+        "UPDATE roadmap_steps SET status = ? WHERE id = ? AND learner_id = ?",
+        (status, step_id, learner["id"]),
     )
     if result.rowcount == 0:
         raise HTTPException(status_code=404, detail="Roadmap step not found")
     db.commit()
-    step = db.execute("SELECT * FROM roadmap_steps WHERE id = ?", (step_id,)).fetchone()
+    step = db.execute(
+        "SELECT * FROM roadmap_steps WHERE id = ? AND learner_id = ?",
+        (step_id, learner["id"]),
+    ).fetchone()
     item = dict(step)
     item["exercises"] = json.loads(item.pop("exercises_json", "[]"))
     item["resources"] = json.loads(item.pop("resources_json", "[]"))
@@ -206,13 +299,14 @@ def update_roadmap_step(step_id: int, status: str, db: Database) -> dict[str, An
 
 
 @app.get("/api/assessments", response_model=list[AssessmentAttempt])
-def get_assessment_history(db: Database) -> list[dict[str, Any]]:
+def get_assessment_history(db: Database, learner: CurrentLearner) -> list[dict[str, Any]]:
     rows = db.execute(
         """
         SELECT id, target_career, score, total_questions, correct_count,
                weak_topics_json, created_at
-        FROM assessment_attempts WHERE learner_id = 1 ORDER BY id DESC
-        """
+        FROM assessment_attempts WHERE learner_id = ? ORDER BY id DESC
+        """,
+        (learner["id"],),
     ).fetchall()
     return [
         {
@@ -232,10 +326,11 @@ def get_assessment_questions() -> list[dict[str, Any]]:
 
 
 @app.post("/api/agents/analyze")
-def analyze_learning_path(payload: AnalysisRequest, db: Database) -> StreamingResponse:
-    learner = db.execute("SELECT * FROM learners WHERE id = 1").fetchone()
-    if learner is None:
-        raise HTTPException(status_code=404, detail="Learner not found")
+def analyze_learning_path(
+    payload: AnalysisRequest,
+    db: Database,
+    learner: CurrentLearner,
+) -> StreamingResponse:
     career = (payload.target_career or learner["target_career"]).strip()
     if not career:
         raise HTTPException(status_code=422, detail="Target career cannot be empty")
@@ -244,12 +339,14 @@ def analyze_learning_path(payload: AnalysisRequest, db: Database) -> StreamingRe
     skills = [
         dict(row)
         for row in db.execute(
-            "SELECT * FROM skills WHERE learner_id = 1 ORDER BY is_gap, id"
+            "SELECT * FROM skills WHERE learner_id = ? ORDER BY is_gap, id",
+            (learner["id"],),
         ).fetchall()
     ]
-    previous_steps = _load_roadmap(db)
+    previous_steps = _load_roadmap(db, learner["id"])
     assessment_row = db.execute(
-        "SELECT * FROM assessment_attempts WHERE learner_id = 1 ORDER BY id DESC LIMIT 1"
+        "SELECT * FROM assessment_attempts WHERE learner_id = ? ORDER BY id DESC LIMIT 1",
+        (learner["id"],),
     ).fetchone()
     latest_assessment = _assessment_context(assessment_row)
     learner_profile = _agent_profile_context(learner)
@@ -264,7 +361,7 @@ def analyze_learning_path(payload: AnalysisRequest, db: Database) -> StreamingRe
             profile=learner_profile,
             assessment=latest_assessment,
         )
-        _replace_roadmap(result["learning_path"]["steps"])
+        _replace_roadmap(learner["id"], result["learning_path"]["steps"])
         return result
 
     return _agent_event_stream(run)
@@ -274,20 +371,19 @@ def analyze_learning_path(payload: AnalysisRequest, db: Database) -> StreamingRe
 def submit_assessment(
     payload: AssessmentSubmission,
     db: Database,
+    learner: CurrentLearner,
 ) -> StreamingResponse:
-    learner = db.execute("SELECT * FROM learners WHERE id = 1").fetchone()
-    if learner is None:
-        raise HTTPException(status_code=404, detail="Learner not found")
     career = (payload.target_career or learner["target_career"]).strip()
     if career not in CAREER_REQUIREMENTS:
         raise HTTPException(status_code=422, detail="Select a supported target career")
     skills = [
         dict(row)
         for row in db.execute(
-            "SELECT * FROM skills WHERE learner_id = 1 ORDER BY is_gap, id"
+            "SELECT * FROM skills WHERE learner_id = ? ORDER BY is_gap, id",
+            (learner["id"],),
         ).fetchall()
     ]
-    previous_steps = _load_roadmap(db)
+    previous_steps = _load_roadmap(db, learner["id"])
     answers = [answer.model_dump() for answer in payload.answers]
     learner_profile = _agent_profile_context(learner)
     orchestrator = AgentOrchestrator()
@@ -301,26 +397,35 @@ def submit_assessment(
             on_activity,
             profile=learner_profile,
         )
-        _persist_assessment_adaptation(career, result["updated_roadmap"]["steps"], result["assessment"])
+        _persist_assessment_adaptation(
+            learner["id"],
+            career,
+            result["updated_roadmap"]["steps"],
+            result["assessment"],
+        )
         return result
 
     return _agent_event_stream(run)
 
 
 @app.post("/api/mentor/chat")
-def mentor_chat(payload: MentorMessage, db: Database) -> dict[str, str]:
-    learner = db.execute("SELECT * FROM learners WHERE id = 1").fetchone()
-    if learner is None:
-        raise HTTPException(status_code=404, detail="Learner not found")
+def mentor_chat(
+    payload: MentorMessage,
+    db: Database,
+    learner: CurrentLearner,
+) -> dict[str, str]:
     skills = [
         dict(row)
         for row in db.execute(
-            "SELECT * FROM skills WHERE learner_id = 1 ORDER BY is_gap, id"
+            "SELECT * FROM skills WHERE learner_id = ? ORDER BY is_gap, id",
+            (learner["id"],),
         ).fetchall()
     ]
     latest_assessment_row = db.execute(
-        "SELECT * FROM assessment_attempts WHERE learner_id = 1 ORDER BY id DESC LIMIT 1"
+        "SELECT * FROM assessment_attempts WHERE learner_id = ? ORDER BY id DESC LIMIT 1",
+        (learner["id"],),
     ).fetchone()
+    previous_steps = _load_roadmap(db, learner["id"])
     mentor = MentorAgent(AgentOrchestrator().runtime)
     try:
         reply = mentor.respond(
@@ -329,6 +434,7 @@ def mentor_chat(payload: MentorMessage, db: Database) -> dict[str, str]:
             skills,
             _agent_profile_context(learner),
             _assessment_context(latest_assessment_row),
+            previous_steps,
         )
     except AgentProviderError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -339,9 +445,10 @@ def mentor_chat(payload: MentorMessage, db: Database) -> dict[str, str]:
     }
 
 
-def _load_roadmap(db: sqlite3.Connection) -> list[dict[str, Any]]:
+def _load_roadmap(db: sqlite3.Connection, learner_id: int) -> list[dict[str, Any]]:
     rows = db.execute(
-        "SELECT * FROM roadmap_steps WHERE learner_id = 1 ORDER BY position"
+        "SELECT * FROM roadmap_steps WHERE learner_id = ? ORDER BY position",
+        (learner_id,),
     ).fetchall()
     steps: list[dict[str, Any]] = []
     for row in rows:
@@ -354,13 +461,18 @@ def _load_roadmap(db: sqlite3.Connection) -> list[dict[str, Any]]:
 
 def _learner_response(row: sqlite3.Row) -> dict[str, object]:
     learner = dict(row)
+    learner.pop("password_hash", None)
     learner["certifications"] = json.loads(learner.pop("certifications_json", "[]"))
     learner["projects"] = json.loads(learner.pop("projects_json", "[]"))
     return learner
 
 
-def _agent_profile_context(row: sqlite3.Row) -> dict[str, list[str]]:
+def _agent_profile_context(row: sqlite3.Row) -> dict[str, Any]:
     return {
+        "education": row["education"],
+        "academic_level": row["academic_level"],
+        "institution": row["institution"],
+        "experience": row["experience"],
         "certifications": json.loads(row["certifications_json"]),
         "projects": json.loads(row["projects_json"]),
     }
@@ -380,21 +492,23 @@ def _assessment_context(row: sqlite3.Row | None) -> dict[str, Any] | None:
 
 
 def _persist_assessment_adaptation(
+    learner_id: int,
     career: str,
     steps: list[dict[str, Any]],
     assessment: dict[str, Any],
 ) -> None:
     connection = get_connection()
     try:
-        _write_roadmap(connection, steps)
+        _write_roadmap(connection, learner_id, steps)
         connection.execute(
             """
             INSERT INTO assessment_attempts
                 (learner_id, target_career, score, total_questions, correct_count,
                  weak_topics_json, results_json)
-            VALUES (1, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                learner_id,
                 career,
                 assessment["score"],
                 assessment["total_questions"],
@@ -408,26 +522,31 @@ def _persist_assessment_adaptation(
         connection.close()
 
 
-def _replace_roadmap(steps: list[dict[str, Any]]) -> None:
+def _replace_roadmap(learner_id: int, steps: list[dict[str, Any]]) -> None:
     connection = get_connection()
     try:
-        _write_roadmap(connection, steps)
+        _write_roadmap(connection, learner_id, steps)
         connection.commit()
     finally:
         connection.close()
 
 
-def _write_roadmap(connection: sqlite3.Connection, steps: list[dict[str, Any]]) -> None:
-    connection.execute("DELETE FROM roadmap_steps WHERE learner_id = 1")
+def _write_roadmap(
+    connection: sqlite3.Connection,
+    learner_id: int,
+    steps: list[dict[str, Any]],
+) -> None:
+    connection.execute("DELETE FROM roadmap_steps WHERE learner_id = ?", (learner_id,))
     connection.executemany(
         """
         INSERT INTO roadmap_steps
             (learner_id, title, duration, lessons, description, status, position,
              exercises_json, resources_json)
-        VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             (
+                learner_id,
                 step["title"],
                 step["duration"],
                 step["lessons"],
@@ -440,6 +559,16 @@ def _write_roadmap(connection: sqlite3.Connection, steps: list[dict[str, Any]]) 
             for position, step in enumerate(steps, start=1)
         ],
     )
+
+
+def _skill_level(progress: int) -> str:
+    if progress == 0:
+        return "Not started"
+    if progress < 40:
+        return "Beginner"
+    if progress < 75:
+        return "Intermediate"
+    return "Advanced"
 
 
 def _agent_event_stream(

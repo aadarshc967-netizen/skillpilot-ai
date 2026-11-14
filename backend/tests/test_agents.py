@@ -24,12 +24,30 @@ from backend.app.main import app
 @pytest.fixture(autouse=True)
 def demo_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GEMINI_API_KEY", "")
+    monkeypatch.setenv("SKILLPILOT_DEMO_MODE", "true")
 
 
 @pytest.fixture
 def client(tmp_path, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
     monkeypatch.setattr(database, "DATABASE_PATH", tmp_path / "skillpilot-test.db")
     with TestClient(app) as test_client:
+        response = test_client.post(
+            "/api/auth/signup",
+            json={"name": "Test Learner", "email": "test@example.com", "password": "test-password-123"},
+        )
+        assert response.status_code == 201
+        token = response.json()["access_token"]
+        test_client.headers.update({"Authorization": f"Bearer {token}"})
+        for skill in sample_skills():
+            response = test_client.post(
+                "/api/skills",
+                json={key: skill[key] for key in ("name", "category", "progress")},
+            )
+            assert response.status_code == 201
+        response = test_client.put("/api/learner/career", json={"target_career": "Full Stack Developer"})
+        assert response.status_code == 200
+        response = test_client.post("/api/agents/analyze", json={})
+        assert response.status_code == 200
         yield test_client
 
 
@@ -82,6 +100,90 @@ def sample_roadmap() -> list[dict[str, object]]:
             "resources": ["https://react.dev/learn"],
         },
     ]
+
+
+def test_new_account_is_empty_and_account_routes_require_authentication(client: TestClient) -> None:
+    response = client.post(
+        "/api/auth/signup",
+        json={"name": "New Learner", "email": "new@example.com", "password": "new-password-123"},
+    )
+    assert response.status_code == 201
+    account = response.json()
+    assert "password_hash" not in account["learner"]
+    headers = {"Authorization": f"Bearer {account['access_token']}"}
+
+    assert client.get("/api/learner", headers=headers).json()["target_career"] == ""
+    assert client.get("/api/skills", headers=headers).json() == []
+    assert client.get("/api/roadmap", headers=headers).json() == []
+    assert client.get("/api/assessments", headers=headers).json() == []
+    assert client.post("/api/agents/analyze", json={}, headers=headers).status_code == 422
+    assert client.post(
+        "/api/auth/login",
+        json={"email": "new@example.com", "password": "new-password-123"},
+    ).status_code == 200
+    assert client.get("/api/learner", headers={"Authorization": "Bearer invalid"}).status_code == 401
+    assert client.get("/api/skills", headers={"Authorization": "Bearer invalid"}).status_code == 401
+
+
+def test_two_users_cannot_read_or_modify_each_others_data(client: TestClient) -> None:
+    first_learner = client.get("/api/learner").json()
+    first_skill = client.get("/api/skills").json()[0]
+    first_step = client.get("/api/roadmap").json()[0]
+    second_account = client.post(
+        "/api/auth/signup",
+        json={"name": "Second Learner", "email": "second@example.com", "password": "second-password-123"},
+    ).json()
+    second_headers = {"Authorization": f"Bearer {second_account['access_token']}"}
+    assert client.put(
+        "/api/learner/career",
+        json={"target_career": "Full Stack Developer"},
+        headers=second_headers,
+    ).status_code == 200
+
+    second_profile = client.get("/api/learner", headers=second_headers).json()
+    assert second_profile["id"] != first_learner["id"]
+    assert second_profile["name"] == "Second Learner"
+    assert client.get("/api/skills", headers=second_headers).json() == []
+    assert client.get("/api/roadmap", headers=second_headers).json() == []
+    assert client.get("/api/assessments", headers=second_headers).json() == []
+
+    assert client.put(
+        f"/api/skills/{first_skill['id']}",
+        json={"progress": 100},
+        headers=second_headers,
+    ).status_code == 404
+    assert client.put(
+        f"/api/roadmap/{first_step['id']}?status=complete",
+        headers=second_headers,
+    ).status_code == 404
+    assert client.get("/api/skills").json()[0]["progress"] == first_skill["progress"]
+    assert client.get("/api/learner").json()["name"] == first_learner["name"]
+
+    profile_update = {
+        "name": "Second Learner Updated",
+        "email": "second@example.com",
+        "education": "",
+        "academic_level": "",
+        "institution": "",
+        "experience": "",
+        "certifications": [],
+        "projects": [],
+    }
+    assert client.put("/api/learner/profile", json=profile_update, headers=second_headers).status_code == 200
+    assert client.get("/api/learner").json()["name"] == first_learner["name"]
+
+    attempt = client.post(
+        "/api/agents/assessment",
+        json={"answers": [
+            {"question_id": "js-scope", "answer": "const"},
+            {"question_id": "js-array-map", "answer": "A number"},
+            {"question_id": "js-promise", "answer": "catch()"},
+        ]},
+        headers=second_headers,
+    )
+    assert attempt.status_code == 200
+    assert len(client.get("/api/assessments", headers=second_headers).json()) == 1
+    assert client.get("/api/assessments").json() == []
 
 
 def test_analysis_agents_run_in_sequence_and_pass_outputs() -> None:
@@ -238,7 +340,12 @@ def test_http_assessment_stream_updates_persisted_roadmap(client: TestClient) ->
 
     assert result["mode"] == "demo"
     assert result["roadmap_changed"] is True
-    assert persisted_roadmap[1]["title"] == "Targeted practice: JavaScript scope"
+    assert persisted_roadmap[1]["title"].startswith("Targeted practice: JavaScript ")
+    assert {step["title"] for step in persisted_roadmap} >= {
+        "Targeted practice: JavaScript scope",
+        "Targeted practice: JavaScript arrays",
+        "Targeted practice: JavaScript promises",
+    }
     assert persisted_roadmap[1]["exercises"]
     assert persisted_roadmap[1]["resources"]
 
@@ -291,10 +398,7 @@ def test_changing_career_regenerates_career_specific_roadmap(client: TestClient)
     assert any("Statistics" in title for title in roadmap_titles)
     assert any("Data visualization" in title for title in roadmap_titles)
     assert all("React" not in title and "JavaScript" not in title for title in roadmap_titles)
-    role_skills = client.get("/api/skills").json()
-    statistics = next(skill for skill in role_skills if skill["name"] == "Statistics")
-    assert statistics["progress"] == 0
-    assert statistics["is_gap"] is True
+    assert "Statistics" in result_event["data"]["career_match"]["missing_requirements"]
 
 
 def test_http_agent_stream_reports_stage_failure(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -405,7 +509,7 @@ def test_profile_fields_migrate_on_existing_database(tmp_path, monkeypatch: pyte
         connection.executescript(
             """
             CREATE TABLE learners (id INTEGER PRIMARY KEY, name TEXT, email TEXT, target_career TEXT);
-            INSERT INTO learners VALUES (1, 'Jordan Miller', 'jordan@example.com', 'Full Stack Developer');
+            INSERT INTO learners VALUES (1, 'Legacy Learner', 'legacy@example.com', 'Full Stack Developer');
             """
         )
 
@@ -468,8 +572,9 @@ def test_assessment_rejects_duplicate_or_partial_submissions() -> None:
         agent.run([{"question_id": "js-scope", "answer": "let"}])
 
 
-def test_live_gemini_failure_activates_labeled_demo_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_live_gemini_failure_does_not_activate_demo_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GEMINI_API_KEY", "test-key-not-used")
+    monkeypatch.setenv("SKILLPILOT_DEMO_MODE", "false")
 
     class BrokenModels:
         @staticmethod
@@ -484,34 +589,39 @@ def test_live_gemini_failure_activates_labeled_demo_fallback(monkeypatch: pytest
     assert runtime.demo_mode is False
     with pytest.raises(AgentProviderError, match="Gemini agent request failed"):
         runtime.generate("test", SkillAnalysis)
-    assert runtime.demo_mode is True
-    assert runtime.fallback_reason is not None
+    assert runtime.demo_mode is False
+    assert runtime.fallback_reason is None
 
 
-def test_orchestrator_continues_in_demo_after_gemini_quota_error(
+def test_missing_gemini_key_requires_explicit_demo_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("GEMINI_API_KEY", "test-key-not-used")
-
-    class QuotaLimitedModels:
-        @staticmethod
-        def generate_content(**_kwargs: object) -> None:
-            raise RuntimeError("429 quota exceeded")
-
+    monkeypatch.setenv("GEMINI_API_KEY", "")
+    monkeypatch.setenv("SKILLPILOT_DEMO_MODE", "false")
     runtime = AgentRuntime()
-    runtime._client = type("QuotaLimitedClient", (), {"models": QuotaLimitedModels()})()
-    activities: list[dict[str, object]] = []
-    result = AgentOrchestrator(runtime).analyze(
-        "Full Stack Developer",
-        sample_skills(),
-        sample_roadmap(),
-        activities.append,
-    )
+    assert runtime.demo_mode is False
+    assert AgentOrchestrator(runtime).mode == "unavailable"
+    with pytest.raises(AgentProviderError, match="GEMINI_API_KEY is not configured"):
+        runtime.generate("test", SkillAnalysis)
 
-    assert result["mode"] == "demo"
-    assert result["mode_reason"] == "Gemini is unavailable or over quota; deterministic demo mode is active."
-    assert len([activity for activity in activities if activity["status"] == "completed"]) == 3
-    assert result["learning_path"]["steps"]
+
+def test_agent_endpoint_surfaces_live_provider_failure_without_demo_result(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "")
+    monkeypatch.setenv("SKILLPILOT_DEMO_MODE", "false")
+    response = client.post("/api/agents/analyze", json={})
+    events = [
+        json.loads(line.removeprefix("data: ").strip())
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
+
+    assert response.status_code == 200
+    assert not any(event["type"] == "result" for event in events)
+    assert events[-1]["type"] == "error"
+    assert "GEMINI_API_KEY is not configured" in events[-1]["message"]
 
 
 def test_existing_sqlite_roadmap_schema_is_migrated_without_data_loss(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -529,7 +639,7 @@ def test_existing_sqlite_roadmap_schema_is_migrated_without_data_loss(tmp_path, 
                 id INTEGER PRIMARY KEY, learner_id INTEGER, title TEXT, duration TEXT,
                 lessons INTEGER, description TEXT, status TEXT, position INTEGER
             );
-            INSERT INTO learners VALUES (1, 'Jordan Miller', 'jordan@example.com', 'Full Stack Developer');
+            INSERT INTO learners VALUES (1, 'Legacy Learner', 'legacy@example.com', 'Full Stack Developer');
             INSERT INTO roadmap_steps VALUES (1, 1, 'Existing step', '1 week', 2, 'Keep me', 'in-progress', 1);
             """
         )

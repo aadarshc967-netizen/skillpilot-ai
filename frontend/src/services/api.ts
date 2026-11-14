@@ -5,8 +5,18 @@ export type LearnerRecord = {
   name: string
   email: string
   target_career: string
+  education: string
+  academic_level: string
+  institution: string
+  experience: string
   certifications: string[]
   projects: string[]
+}
+
+export type AuthResult = {
+  access_token: string
+  token_type: 'bearer'
+  learner: LearnerRecord
 }
 
 export type AssessmentAttempt = {
@@ -27,6 +37,18 @@ export type SkillRecord = {
   progress: number
   is_gap: boolean
   priority: string
+}
+
+export type RoadmapStep = {
+  id: number
+  title: string
+  duration: string
+  lessons: number
+  description: string
+  status: 'complete' | 'in-progress' | 'up-next' | 'locked'
+  position: number
+  exercises: string[]
+  resources: string[]
 }
 
 export type RoadmapRecord = {
@@ -104,8 +126,15 @@ export type MentorReply = {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API_BASE_URL}${path}`, init)
+  const headers = new Headers(init?.headers)
+  const token = getAuthToken()
+  if (token && !path.startsWith('/api/auth/')) headers.set('Authorization', `Bearer ${token}`)
+  const response = await fetch(`${API_BASE_URL}${path}`, { ...init, headers })
   if (!response.ok) {
+    if (response.status === 401 && token) {
+      setAuthToken(null)
+      window.dispatchEvent(new Event('skillpilot:unauthorized'))
+    }
     const body = await response.json().catch(() => null) as { detail?: string } | null
     throw new Error(body?.detail ?? `SkillPilot API request failed (${response.status} ${response.statusText})`)
   }
@@ -117,12 +146,19 @@ async function streamRequest<T>(
   body: unknown,
   onActivity: (activity: AgentActivity) => void,
 ): Promise<T> {
+  const token = getAuthToken()
+  const headers = new Headers({ 'Content-Type': 'application/json', Accept: 'text/event-stream' })
+  if (token) headers.set('Authorization', `Bearer ${token}`)
   const response = await fetch(`${API_BASE_URL}${path}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+    headers,
     body: JSON.stringify(body),
   })
   if (!response.ok) {
+    if (response.status === 401 && token) {
+      setAuthToken(null)
+      window.dispatchEvent(new Event('skillpilot:unauthorized'))
+    }
     const error = await response.json().catch(() => null) as { detail?: string } | null
     throw new Error(error?.detail ?? `SkillPilot API request failed (${response.status} ${response.statusText})`)
   }
@@ -165,9 +201,41 @@ async function streamRequest<T>(
   return result
 }
 
+const TOKEN_STORAGE_KEY = 'skillpilot_access_token'
+
+export function getAuthToken(): string | null {
+  return localStorage.getItem(TOKEN_STORAGE_KEY)
+}
+
+export function setAuthToken(token: string | null) {
+  if (token) localStorage.setItem(TOKEN_STORAGE_KEY, token)
+  else localStorage.removeItem(TOKEN_STORAGE_KEY)
+}
+
+export const authApi = {
+  signup: (name: string, email: string, password: string) =>
+    request<AuthResult>('/api/auth/signup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, email, password }),
+    }),
+  login: (email: string, password: string) =>
+    request<AuthResult>('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password }),
+    }),
+}
+
 export const learnerApi = {
+  addSkill: (skill: { name: string; category: string; progress: number }) =>
+    request<SkillRecord>('/api/skills', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(skill),
+    }),
   getProfile: () => request<LearnerRecord>('/api/learner'),
-  updateProfile: (profile: Pick<LearnerRecord, 'name' | 'email' | 'certifications' | 'projects'>) =>
+  updateProfile: (profile: Pick<LearnerRecord, 'name' | 'email' | 'education' | 'academic_level' | 'institution' | 'experience' | 'certifications' | 'projects'>) =>
     request<LearnerRecord>('/api/learner/profile', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },

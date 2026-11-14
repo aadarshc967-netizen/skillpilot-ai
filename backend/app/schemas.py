@@ -8,8 +8,29 @@ class Learner(BaseModel):
     name: str
     email: str
     target_career: str
+    education: str = ""
+    academic_level: str = ""
+    institution: str = ""
+    experience: str = ""
     certifications: list[str] = Field(default_factory=list)
     projects: list[str] = Field(default_factory=list)
+
+
+class SignupRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=10, max_length=128)
+
+
+class LoginRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=1, max_length=128)
+
+
+class AuthResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    learner: Learner
 
 
 class CareerUpdate(BaseModel):
@@ -19,6 +40,10 @@ class CareerUpdate(BaseModel):
 class LearnerProfileUpdate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     email: str = Field(min_length=3, max_length=254)
+    education: str = Field(default="", max_length=500)
+    academic_level: str = Field(default="", max_length=120)
+    institution: str = Field(default="", max_length=200)
+    experience: str = Field(default="", max_length=5000)
     certifications: list[str] = Field(default_factory=list, max_length=30)
     projects: list[str] = Field(default_factory=list, max_length=30)
 
@@ -37,6 +62,12 @@ class Skill(BaseModel):
 
 class SkillProgressUpdate(BaseModel):
     progress: int = Field(ge=0, le=100)
+
+
+class SkillCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    category: str = Field(min_length=1, max_length=100)
+    progress: int = Field(default=0, ge=0, le=100)
 
 
 class AssessmentAttempt(BaseModel):

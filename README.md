@@ -10,7 +10,7 @@ npm install
 npm run dev
 ```
 
-The dashboard starts with a sample learner, Jordan Miller, whose target is Full Stack Developer. Profile and sample display data live in `frontend/src/data.ts`. The app uses the FastAPI endpoints for agent analysis, assessments, and mentor chat.
+Create an account or sign in from the dashboard. New accounts start with an empty learner profile, skills, roadmap, and assessment history. Add profile details, skills, and a career goal to generate a personalized analysis and roadmap.
 
 The typed API adapter in `frontend/src/services/api.ts` targets the FastAPI server at `http://127.0.0.1:8000` by default. Set `VITE_API_BASE_URL` to override it.
 
@@ -26,11 +26,14 @@ uvicorn app.main:app --reload
 
 The API initializes a local SQLite database at `backend/data/skillpilot.db`. Learner profile details, skills, roadmap progress, and assessment attempts are persisted there.
 
+- `POST /api/auth/signup`
+- `POST /api/auth/login`
 - `GET /api/health`
-- `GET /api/learner`
+- `GET /api/learner` (authenticated)
 - `PUT /api/learner/career`
 - `PUT /api/learner/profile` (learner details, certifications, projects)
 - `GET /api/skills`
+- `POST /api/skills`
 - `PUT /api/skills/{skill_id}` (persist proficiency updates)
 - `GET /api/roadmap`
 - `PUT /api/roadmap/{step_id}` (persist roadmap status)
@@ -54,7 +57,9 @@ $env:GEMINI_MODEL = "gemini-3.8-flash"
 uvicorn app.main:app --reload
 ```
 
-Without `GEMINI_API_KEY`, the backend uses deterministic demo behavior, returned with `mode: "demo"` and labeled as demo mode in the UI. Demo mode is not a live AI response. If Gemini is unavailable, returns an invalid response, or is over quota, the current orchestration run switches to deterministic demo behavior and returns a visible fallback reason. The key is loaded from `backend/.env` (or the process environment) and must never be committed.
+The backend loads `GEMINI_API_KEY` from `backend/.env` or the process environment. Live Gemini errors are reported; the application does not silently switch to demo responses. To explicitly enable deterministic demo behavior for a local demonstration, set `SKILLPILOT_DEMO_MODE=true`. The UI labels those results as demo output, not live AI.
+
+Learner endpoints require a bearer token returned by signup or login. Passwords are stored as salted PBKDF2 hashes. Set a persistent, securely generated `JWT_SECRET_KEY` (at least 32 characters) in the backend environment to keep tokens valid across restarts; production mode refuses to run authenticated requests without it. Never commit `.env` files, API keys, or the database.
 
 Backend tests:
 

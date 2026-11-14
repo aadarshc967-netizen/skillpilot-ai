@@ -1,23 +1,21 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import './App.css'
 import {
+  authApi,
+  getAuthToken,
   learnerApi,
+  setAuthToken,
   type AgentActivity,
   type AgentRunResult,
   type AssessmentQuestion,
   type AssessmentAttempt,
   type AssessmentRunResult,
   type LearnerRecord,
+  type RoadmapRecord,
+  type RoadmapStep,
   type SkillRecord,
 } from './services/api'
-import {
-  careerOptions,
-  getSkillGapsForCareer,
-  initialRoadmap,
-  learner,
-  navigation,
-  type RoadmapStep,
-} from './data'
+import { careerOptions, navigation } from './data'
 
 type IconName =
   | 'dashboard'
@@ -74,6 +72,7 @@ function Sidebar({
   onNavigate,
   open,
   onClose,
+  onLogout,
 }: {
   profile: LearnerRecord
   roadmapCount: number
@@ -81,6 +80,7 @@ function Sidebar({
   onNavigate: (page: string) => void
   open: boolean
   onClose: () => void
+  onLogout: () => void
 }) {
   const initials = profile.name.split(/\s+/).map((part) => part[0]).join('').slice(0, 2).toUpperCase()
   return (
@@ -113,6 +113,7 @@ function Sidebar({
           <button className={`nav-item settings-link ${activePage === 'Settings' ? 'nav-active' : ''}`} onClick={() => onNavigate('Settings')}>
             <Icon name="settings" size={17} /><span>Settings</span>
           </button>
+          <button className="nav-item settings-link" onClick={onLogout}>Sign out</button>
           <div className="sidebar-profile">
             <div className="avatar avatar-small">{initials}</div>
             <div className="profile-copy"><strong>{profile.name}</strong><span>Free plan</span></div>
@@ -215,24 +216,92 @@ function AgentActivityPanel({
   )
 }
 
+function AuthPage({ onAuthenticated }: { onAuthenticated: (token: string) => void }) {
+  const [signup, setSignup] = useState(true)
+  const [name, setName] = useState('')
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [showPassword, setShowPassword] = useState(false)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  function changeMode(nextSignup: boolean) {
+    setSignup(nextSignup)
+    setError(null)
+    setPassword('')
+    setShowPassword(false)
+  }
+
+  async function submit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (loading) return
+    setLoading(true)
+    setError(null)
+    try {
+      const result = signup
+        ? await authApi.signup(name, email, password)
+        : await authApi.login(email, password)
+      onAuthenticated(result.access_token)
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Account request failed.')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <main className="auth-page">
+      <form className="card auth-card" onSubmit={(event) => void submit(event)}>
+        <div className="brand auth-brand"><span className="brand-mark"><span /></span><span>skillpilot<span className="brand-ai">.ai</span></span></div>
+        <h1>{signup ? 'Create your account' : 'Welcome back'}</h1>
+        <p className="auth-intro">{signup ? 'Sign up to start your personalized learning journey.' : 'Log in to continue your learning journey.'}</p>
+        <div className="auth-mode-switch" aria-label="Choose login or signup">
+          <button type="button" className={!signup ? 'auth-mode-active' : ''} aria-pressed={!signup} onClick={() => changeMode(false)}>Log in</button>
+          <button type="button" className={signup ? 'auth-mode-active' : ''} aria-pressed={signup} onClick={() => changeMode(true)}>Sign up</button>
+        </div>
+        {signup && <label className="auth-field" htmlFor="auth-name"><span>Name</span><input id="auth-name" autoComplete="name" required maxLength={120} value={name} onChange={(event) => setName(event.target.value)} placeholder="Enter your name" /></label>}
+        <label className="auth-field" htmlFor="auth-email"><span>Email</span><input id="auth-email" type="email" autoComplete="email" required maxLength={254} value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@example.com" /></label>
+        <label className="auth-field" htmlFor="auth-password">
+          <span>Password</span>
+          <span className="auth-password-wrap">
+            <input id="auth-password" type={showPassword ? 'text' : 'password'} autoComplete={signup ? 'new-password' : 'current-password'} required minLength={signup ? 10 : 1} maxLength={128} value={password} onChange={(event) => setPassword(event.target.value)} placeholder={signup ? 'At least 10 characters' : 'Enter your password'} />
+            <button type="button" className="auth-password-toggle" aria-label={showPassword ? 'Hide password' : 'Show password'} aria-pressed={showPassword} onClick={() => setShowPassword((visible) => !visible)}>{showPassword ? 'Hide' : 'Show'}</button>
+          </span>
+        </label>
+        {error && <div className="agent-error" role="alert">{error}</div>}
+        <button className="primary-action auth-submit" type="submit" disabled={loading}>{loading ? 'Please wait…' : signup ? 'Sign up' : 'Log in'}</button>
+      </form>
+    </main>
+  )
+}
+
+function emptyLearnerProfile(): LearnerRecord {
+  return {
+    id: 0,
+    name: '',
+    email: '',
+    target_career: '',
+    education: '',
+    academic_level: '',
+    institution: '',
+    experience: '',
+    certifications: [],
+    projects: [],
+  }
+}
+
 function App() {
+  const [authenticated, setAuthenticated] = useState(Boolean(getAuthToken()))
   const [activePage, setActivePage] = useState('Overview')
   const [today] = useState(() => new Intl.DateTimeFormat(
     undefined,
     { weekday: 'long', month: 'short', day: 'numeric' },
   ).format(new Date()))
-  const [career, setCareer] = useState(learner.targetCareer)
-  const [profile, setProfile] = useState<LearnerRecord>({
-    id: 1,
-    name: learner.name,
-    email: learner.email,
-    target_career: learner.targetCareer,
-    certifications: [],
-    projects: [],
-  })
+  const [career, setCareer] = useState('')
+  const [profile, setProfile] = useState<LearnerRecord>(emptyLearnerProfile)
   const [skills, setSkills] = useState<SkillRecord[]>([])
-  const [roadmap, setRoadmap] = useState(initialRoadmap)
-  const [expandedStep, setExpandedStep] = useState<number | null>(1)
+  const [roadmap, setRoadmap] = useState<RoadmapRecord[]>([])
+  const [expandedStep, setExpandedStep] = useState<number | null>(null)
   const [search, setSearch] = useState('')
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const [agentActivities, setAgentActivities] = useState<AgentActivity[]>([])
@@ -243,9 +312,10 @@ function App() {
   const [assessmentHistory, setAssessmentHistory] = useState<AssessmentAttempt[]>([])
   const [careerSaving, setCareerSaving] = useState(false)
   const [profileSaving, setProfileSaving] = useState(false)
-  const [profileLoading, setProfileLoading] = useState(true)
+  const [profileLoading, setProfileLoading] = useState(Boolean(getAuthToken()))
 
   useEffect(() => {
+    if (!authenticated) return
     let active = true
     Promise.all([
       learnerApi.getProfile(),
@@ -257,6 +327,7 @@ function App() {
         if (!active) return
         setProfile(savedProfile)
         setCareer(savedProfile.target_career)
+        if (!savedProfile.target_career) setActivePage('Settings')
         setRoadmap(savedRoadmap)
         setSkills(savedSkills)
         setAssessmentHistory(savedAssessments)
@@ -269,11 +340,30 @@ function App() {
         if (active) setProfileLoading(false)
       })
     return () => { active = false }
+  }, [authenticated])
+
+  useEffect(() => {
+    const handleUnauthorized = () => {
+      setAuthToken(null)
+      setAuthenticated(false)
+      setProfileLoading(false)
+      setProfile(emptyLearnerProfile())
+      setCareer('')
+      setSkills([])
+      setRoadmap([])
+      setAssessmentHistory([])
+      setAssessmentResult(null)
+      setAgentResult(null)
+      setAgentActivities([])
+      setAgentError(null)
+    }
+    window.addEventListener('skillpilot:unauthorized', handleUnauthorized)
+    return () => window.removeEventListener('skillpilot:unauthorized', handleUnauthorized)
   }, [])
 
   const completedSteps = roadmap.filter((step) => step.status === 'complete').length
   const roadmapProgress = roadmap.length ? Math.round((completedSteps / roadmap.length) * 100) : 0
-  const firstName = profile.name.split(/\s+/)[0] || learner.firstName
+  const firstName = profile.name.split(/\s+/)[0] || 'there'
   const currentSkills = skills.filter((skill) => skill.progress > 0)
   const analysisGaps = agentResult?.skill_analysis.skill_gaps.map((finding) => ({
     name: finding.name,
@@ -281,9 +371,7 @@ function App() {
     category: finding.category,
     priority: finding.priority,
   }))
-  const gapsForCareer = agentResult
-    ? analysisGaps ?? []
-    : getSkillGapsForCareer(career)
+  const gapsForCareer = agentResult ? analysisGaps ?? [] : []
   const filteredRoadmap = useMemo(
     () => roadmap.filter((step) => step.title.toLowerCase().includes(search.toLowerCase())),
     [roadmap, search],
@@ -295,7 +383,7 @@ function App() {
     const status = previous.status === 'complete' ? 'in-progress' : 'complete'
     setRoadmap((steps) => steps.map((step) => {
       if (step.id !== stepId) return step
-      return { ...step, status } as RoadmapStep
+      return { ...step, status }
     }))
     try {
       await learnerApi.updateRoadmapStatus(stepId, status)
@@ -314,6 +402,10 @@ function App() {
   }
 
   async function runAnalysis(targetCareer = career) {
+    if (!targetCareer) {
+      setAgentError('Choose a target career before running an analysis.')
+      return
+    }
     setAgentLoading(true)
     setAgentError(null)
     setAgentResult(null)
@@ -334,6 +426,7 @@ function App() {
 
   async function changeCareer(targetCareer: string) {
     if (targetCareer === career || careerSaving || profileLoading) return
+    const previousCareer = career
     setCareer(targetCareer)
     setCareerSaving(true)
     setAgentError(null)
@@ -341,8 +434,14 @@ function App() {
     try {
       const savedProfile = await learnerApi.updateCareer(targetCareer)
       setProfile(savedProfile)
-      await runAnalysis(targetCareer)
+      if (targetCareer) {
+        await runAnalysis(targetCareer)
+      } else {
+        setRoadmap([])
+        setAgentActivities([])
+      }
     } catch (error) {
+      setCareer(previousCareer)
       setAgentError(error instanceof Error ? error.message : 'Career goal could not be updated.')
     } finally {
       setCareerSaving(false)
@@ -369,11 +468,13 @@ function App() {
     }
   }
 
-  async function saveProfile(updated: Pick<LearnerRecord, 'name' | 'email' | 'certifications' | 'projects'>) {
+  async function saveProfile(updated: Pick<LearnerRecord, 'name' | 'email' | 'education' | 'academic_level' | 'institution' | 'experience' | 'certifications' | 'projects'>) {
     setProfileSaving(true)
     setAgentError(null)
     try {
-      setProfile(await learnerApi.updateProfile(updated))
+      const saved = await learnerApi.updateProfile(updated)
+      setProfile(saved)
+      if (career) await runAnalysis(career)
     } catch (error) {
       setAgentError(error instanceof Error ? error.message : 'Learner profile could not be saved.')
     } finally {
@@ -385,9 +486,53 @@ function App() {
     try {
       const updated = await learnerApi.updateSkillProgress(skillId, progress)
       setSkills((current) => current.map((skill) => skill.id === skillId ? updated : skill))
+      if (career) await runAnalysis(career)
     } catch (error) {
       setAgentError(error instanceof Error ? error.message : 'Skill progress could not be saved.')
     }
+  }
+
+  async function addSkill(skill: { name: string; category: string; progress: number }) {
+    try {
+      const created = await learnerApi.addSkill(skill)
+      setSkills((current) => [...current, created])
+      if (career) await runAnalysis(career)
+    } catch (error) {
+      setAgentError(error instanceof Error ? error.message : 'Skill could not be added.')
+    }
+  }
+
+  function signOut() {
+    setAuthToken(null)
+    setAuthenticated(false)
+    setProfileLoading(false)
+    setProfile(emptyLearnerProfile())
+    setCareer('')
+    setSkills([])
+    setRoadmap([])
+    setAssessmentHistory([])
+    setAssessmentResult(null)
+    setAgentResult(null)
+    setAgentActivities([])
+    setAgentError(null)
+  }
+
+  if (!authenticated) {
+    return <AuthPage onAuthenticated={(token) => {
+      setAuthToken(token)
+      setProfileLoading(true)
+      setProfile(emptyLearnerProfile())
+      setCareer('')
+      setSkills([])
+      setRoadmap([])
+      setAssessmentHistory([])
+      setAssessmentResult(null)
+      setAgentResult(null)
+      setAgentActivities([])
+      setAgentError(null)
+      setActivePage('Overview')
+      setAuthenticated(true)
+    }} />
   }
 
   const isOverview = activePage === 'Overview'
@@ -398,7 +543,7 @@ function App() {
 
   return (
     <div className="app-shell">
-      <Sidebar profile={profile} roadmapCount={roadmap.length} activePage={activePage} onNavigate={setActivePage} open={mobileNavOpen} onClose={() => setMobileNavOpen(false)} />
+      <Sidebar profile={profile} roadmapCount={roadmap.length} activePage={activePage} onNavigate={setActivePage} open={mobileNavOpen} onClose={() => setMobileNavOpen(false)} onLogout={signOut} />
       <main className="main-content">
         <header className="topbar">
           <div className="topbar-left">
@@ -412,7 +557,7 @@ function App() {
               <kbd>⌘ K</kbd>
             </label>
             <button className="icon-button notification-button" aria-label="Notifications"><Icon name="bell" size={18} /><i /></button>
-            <div className="avatar avatar-top">JM</div>
+            <div className="avatar avatar-top">{profile.name.split(/\s+/).map((part) => part[0]).join('').slice(0, 2).toUpperCase()}</div>
           </div>
         </header>
 
@@ -431,11 +576,12 @@ function App() {
           <section className="hero-card">
             <div className="hero-copy">
               <span className="hero-kicker"><Icon name="target" size={14} /> YOUR NORTH STAR</span>
-              <h2>Become a <span>{career}</span></h2>
-              <p>You're building the skills to turn great ideas into real-world products. Keep your momentum going.</p>
+              <h2>{career ? <>Become a <span>{career}</span></> : <>Choose your <span>career goal</span></>}</h2>
+              <p>{career ? 'Your skill analysis and roadmap are personalized from your profile and learning progress.' : 'Add your learner details and choose a target career to get a personalized roadmap.'}</p>
               <label className="career-select-wrap">
                 <span>My target career</span>
                 <select value={career} disabled={profileLoading || careerSaving || agentLoading} onChange={(event) => void changeCareer(event.target.value)} aria-label="Select target career">
+                  <option value="">Choose a career goal</option>
                   {careerOptions.map((option) => <option key={option} value={option}>{option}</option>)}
                 </select>
                 <Icon name="chevron" size={15} />
@@ -493,7 +639,7 @@ function App() {
               </SkillCard>
 
               <SkillCard title="Skills to unlock" badge={`${gapsForCareer.length} to go`}>
-                <div className="gaps-grid">
+                {gapsForCareer.length ? <div className="gaps-grid">
                   {gapsForCareer.map((skill, index) => (
                     <div className="gap-row" key={skill.name}>
                       <span className={`gap-number ${index === 0 ? 'gap-number-hot' : ''}`}>0{index + 1}</span>
@@ -502,8 +648,8 @@ function App() {
                       <span className={`gap-tag ${skill.priority.toLowerCase()}`}>{skill.priority}</span>
                     </div>
                   ))}
-                </div>
-                <div className="gap-footnote"><span className="info-dot">i</span> These skills are most in-demand for your target role.</div>
+                </div> : <p className="agent-empty">{career ? 'Run the skill analysis to see evidence-based gaps.' : 'Choose a career goal to begin your skill analysis.'}</p>}
+                <div className="gap-footnote"><span className="info-dot">i</span> Gaps are generated from your profile and assessment evidence.</div>
               </SkillCard>
             </div>
 
@@ -524,7 +670,7 @@ function App() {
                       onToggle={() => setExpandedStep(expandedStep === step.id ? null : step.id)}
                       onComplete={() => toggleStep(step.id)}
                     />
-                  )) : <p className="empty-search">No roadmap steps match “{search}”.</p>}
+                  )) : <p className="empty-search">{roadmap.length ? `No roadmap steps match “${search}”.` : 'Your roadmap will appear after you choose a career and run the skill analysis.'}</p>}
                 </div>
                 <button className="roadmap-footer" onClick={() => setActivePage('My roadmap')}>View full roadmap <Icon name="arrow" size={15} /></button>
               </section>
@@ -533,11 +679,11 @@ function App() {
 
           <section className="mentor-card">
             <div className="mentor-orb"><Icon name="spark" size={21} /></div>
-            <div className="mentor-copy"><span className="mentor-label">A NOTE FROM YOUR AI MENTOR</span><p>You're doing great, {firstName}. <strong>{roadmap.find((step) => step.status !== 'complete')?.title ?? 'Your next learning milestone'}</strong> is a good next step. A little practice every day will get you there.</p></div>
+            <div className="mentor-copy"><span className="mentor-label">A NOTE FROM YOUR AI MENTOR</span><p>{career ? <>You're doing great, {firstName}. <strong>{roadmap.find((step) => step.status !== 'complete')?.title ?? 'Your next learning milestone'}</strong> is a good next step. A little practice every day will get you there.</> : 'Set a career goal and add your current skills to receive personalized guidance.'}</p></div>
             <div className="mentor-action"><span>Personalized for your journey</span><button onClick={() => setActivePage('AI Mentor')}>Meet your mentor <Icon name="arrow" size={15} /></button></div>
           </section>
 
-          <AgentActivityPanel activities={agentActivities} loading={agentLoading || careerSaving} disabled={profileLoading} error={agentError} result={agentResult} onAnalyze={() => void runAnalysis()} modeReason={agentResult?.mode_reason} />
+          <AgentActivityPanel activities={agentActivities} loading={agentLoading || careerSaving} disabled={profileLoading || !career} error={agentError} result={agentResult} onAnalyze={() => void runAnalysis()} modeReason={agentResult?.mode_reason} />
 
           <footer className="page-footer"><span>Made for your next big thing.</span><span>Need a hand? <button onClick={() => setActivePage('AI Mentor')}>We're here to help</button></span></footer>
           </> : <PageView
@@ -560,6 +706,7 @@ function App() {
             onProfileSave={saveProfile}
             profileSaving={profileSaving}
             onSkillProgress={saveSkillProgress}
+            onAddSkill={addSkill}
             careerSaving={careerSaving}
             profileLoading={profileLoading}
           />}
@@ -576,10 +723,14 @@ function ProfileEditor({
 }: {
   profile: LearnerRecord
   saving: boolean
-  onSave: (profile: Pick<LearnerRecord, 'name' | 'email' | 'certifications' | 'projects'>) => void
+  onSave: (profile: Pick<LearnerRecord, 'name' | 'email' | 'education' | 'academic_level' | 'institution' | 'experience' | 'certifications' | 'projects'>) => void
 }) {
   const [name, setName] = useState(profile.name)
   const [email, setEmail] = useState(profile.email)
+  const [education, setEducation] = useState(profile.education)
+  const [academicLevel, setAcademicLevel] = useState(profile.academic_level)
+  const [institution, setInstitution] = useState(profile.institution)
+  const [experience, setExperience] = useState(profile.experience)
   const [certifications, setCertifications] = useState(profile.certifications.join('\n'))
   const [projects, setProjects] = useState(profile.projects.join('\n'))
 
@@ -590,10 +741,23 @@ function ProfileEditor({
   return (
     <form className="profile-editor" onSubmit={(event) => {
       event.preventDefault()
-      onSave({ name: name.trim(), email: email.trim(), certifications: lines(certifications), projects: lines(projects) })
+      onSave({
+        name: name.trim(),
+        email: email.trim(),
+        education: education.trim(),
+        academic_level: academicLevel.trim(),
+        institution: institution.trim(),
+        experience: experience.trim(),
+        certifications: lines(certifications),
+        projects: lines(projects),
+      })
     }}>
       <label><span>Name</span><input required maxLength={120} value={name} onChange={(event) => setName(event.target.value)} /></label>
       <label><span>Email</span><input type="email" required maxLength={254} value={email} onChange={(event) => setEmail(event.target.value)} /></label>
+      <label><span>Education</span><input maxLength={500} value={education} onChange={(event) => setEducation(event.target.value)} placeholder="Degree or field of study" /></label>
+      <label><span>Academic level</span><input maxLength={120} value={academicLevel} onChange={(event) => setAcademicLevel(event.target.value)} placeholder="e.g. Undergraduate, graduate" /></label>
+      <label><span>Institution</span><input maxLength={200} value={institution} onChange={(event) => setInstitution(event.target.value)} /></label>
+      <label><span>Experience</span><textarea rows={3} maxLength={5000} value={experience} onChange={(event) => setExperience(event.target.value)} placeholder="Relevant work, volunteering, or self-study" /></label>
       <label><span>Certifications <small>one per line</small></span><textarea rows={3} value={certifications} onChange={(event) => setCertifications(event.target.value)} /></label>
       <label><span>Projects <small>one per line</small></span><textarea rows={3} value={projects} onChange={(event) => setProjects(event.target.value)} /></label>
       <button className="primary-action" type="submit" disabled={saving}>{saving ? <><span className="loading-spinner" /> Saving profile…</> : 'Save learner profile'}</button>
@@ -627,6 +791,30 @@ function SkillProgressEditor({
   )
 }
 
+function SkillCreator({ onAdd }: { onAdd: (skill: { name: string; category: string; progress: number }) => void }) {
+  const [name, setName] = useState('')
+  const [category, setCategory] = useState('')
+  const [progress, setProgress] = useState(0)
+
+  function submit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!name.trim() || !category.trim()) return
+    onAdd({ name: name.trim(), category: category.trim(), progress })
+    setName('')
+    setCategory('')
+    setProgress(0)
+  }
+
+  return (
+    <form className="profile-editor skill-creator" onSubmit={submit}>
+      <label><span>Skill</span><input required maxLength={100} value={name} onChange={(event) => setName(event.target.value)} placeholder="e.g. JavaScript" /></label>
+      <label><span>Category</span><input required maxLength={100} value={category} onChange={(event) => setCategory(event.target.value)} placeholder="e.g. Programming" /></label>
+      <label><span>Current proficiency: {progress}%</span><input type="range" min="0" max="100" value={progress} onChange={(event) => setProgress(Number(event.target.value))} /></label>
+      <button className="primary-action" type="submit">Add skill</button>
+    </form>
+  )
+}
+
 function PageView({
   activePage,
   career,
@@ -646,6 +834,7 @@ function PageView({
   onCareerChange,
   onProfileSave,
   onSkillProgress,
+  onAddSkill,
   careerSaving,
   profileSaving,
   profileLoading,
@@ -666,8 +855,9 @@ function PageView({
   onAnalyze: () => void
   onSubmitAssessment: (answers: Array<{ question_id: string; answer: string }>) => void
   onCareerChange: (career: string) => void
-  onProfileSave: (profile: Pick<LearnerRecord, 'name' | 'email' | 'certifications' | 'projects'>) => void
+  onProfileSave: (profile: Pick<LearnerRecord, 'name' | 'email' | 'education' | 'academic_level' | 'institution' | 'experience' | 'certifications' | 'projects'>) => void
   onSkillProgress: (skillId: number, progress: number) => void
+  onAddSkill: (skill: { name: string; category: string; progress: number }) => void
   careerSaving: boolean
   profileSaving: boolean
   profileLoading: boolean
@@ -721,12 +911,14 @@ function PageView({
       <div className="page-view">
         {agentError && <div className="agent-error" role="alert">{agentError}</div>}
         <SkillCard title="Your skills" badge={`${skills.length} tracked`}>
+          {skills.length === 0 && <p className="agent-empty">No skills added yet. Add skills you have practiced to personalize your analysis.</p>}
           {skills.map((skill) => (
             <SkillProgressEditor key={`${skill.id}-${skill.progress}`} skill={skill} onSave={onSkillProgress} />
           ))}
+          <SkillCreator onAdd={onAddSkill} />
         </SkillCard>
         <SkillCard title="Skills to unlock" badge={`${gaps.length} to go`}>
-          <div className="gaps-grid">
+          {gaps.length > 0 ? <div className="gaps-grid">
             {gaps.map((skill, index) => (
               <div className="gap-row" key={skill.name}>
                 <span className={`gap-number ${index === 0 ? 'gap-number-hot' : ''}`}>0{index + 1}</span>
@@ -735,8 +927,8 @@ function PageView({
                 <span className={`gap-tag ${skill.priority.toLowerCase()}`}>{skill.priority}</span>
               </div>
             ))}
-          </div>
-          <div className="gap-footnote"><span className="info-dot">i</span> Sample skill-gap analysis for {career}.</div>
+          </div> : <p className="agent-empty">{career ? 'Run the skill analysis to identify gaps from your profile.' : 'Choose a career goal to see relevant skill gaps.'}</p>}
+          <div className="gap-footnote"><span className="info-dot">i</span> Gaps are based on your profile and assessment evidence.</div>
         </SkillCard>
       </div>
     )
@@ -759,7 +951,7 @@ function PageView({
                 onComplete={() => onToggleStep(step.id)}
               />
             ))}
-            {roadmap.length === 0 && <p className="empty-search">No roadmap steps match your search.</p>}
+            {roadmap.length === 0 && <p className="empty-search">{career ? 'Run a skill analysis to generate your personalized roadmap.' : 'Choose a target career to create your roadmap.'}</p>}
           </div>
         </section>
       </div>
@@ -791,7 +983,7 @@ function PageView({
           </div>
           {questions.length > 0 && <button
             className="primary-action"
-            disabled={agentLoading || questions.some((question) => !selectedAnswers[question.id])}
+            disabled={!career || agentLoading || questions.some((question) => !selectedAnswers[question.id])}
             onClick={() => onSubmitAssessment(questions.map((question) => ({
               question_id: question.id,
               answer: selectedAnswers[question.id],
@@ -844,11 +1036,11 @@ function PageView({
       <section className="card settings-panel">
         <div className="section-heading"><div><h2>Your learner profile</h2><p>Keep your learner details and portfolio up to date.</p></div></div>
         <div className="settings-person"><div className="avatar settings-avatar">{profile.name.split(/\s+/).map((part) => part[0]).join('').slice(0, 2).toUpperCase()}</div><div><strong>{profile.name}</strong><span>{profile.email}</span></div></div>
-        <label className="settings-career"><span>Target career</span><select value={career} disabled={profileLoading || careerSaving} onChange={(event) => onCareerChange(event.target.value)}>{careerOptions.map((option) => <option key={option}>{option}</option>)}</select></label>
+        <label className="settings-career"><span>Target career</span><select value={career} disabled={profileLoading || careerSaving} onChange={(event) => onCareerChange(event.target.value)}><option value="">Choose a career goal</option>{careerOptions.map((option) => <option key={option} value={option}>{option}</option>)}</select></label>
         {profileLoading
           ? <div className="inline-loading"><span className="loading-spinner" /> Loading profile details…</div>
           : <ProfileEditor profile={profile} saving={profileSaving} onSave={onProfileSave} />}
-        <p className="settings-note">Your current skill-gap analysis is based on the {career} role.</p>
+        <p className="settings-note">{career ? `Your current skill-gap analysis is based on the ${career} role.` : 'Choose a target career to start your skill analysis.'}</p>
       </section>
       <AgentActivityPanel activities={activities} loading={agentLoading || careerSaving} disabled={profileLoading} error={agentError} result={agentResult} onAnalyze={onAnalyze} modeReason={agentResult?.mode_reason} />
     </div>
