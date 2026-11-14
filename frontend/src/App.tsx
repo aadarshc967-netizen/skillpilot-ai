@@ -65,6 +65,15 @@ function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
   )
 }
 
+function safeResourceUrl(value: string): string | null {
+  try {
+    const url = new URL(value)
+    return url.protocol === 'https:' || url.protocol === 'http:' ? url.href : null
+  } catch {
+    return null
+  }
+}
+
 function Sidebar({
   profile,
   roadmapCount,
@@ -95,7 +104,7 @@ function Sidebar({
         <div className="workspace-label">WORKSPACE</div>
         <nav className="nav-list" aria-label="Main navigation">
           {navigation.map((item) => (
-            <button key={item.label} className={`nav-item ${activePage === item.label ? 'nav-active' : ''}`} onClick={() => { onNavigate(item.label); onClose() }}>
+            <button type="button" key={item.label} className={`nav-item ${activePage === item.label ? 'nav-active' : ''}`} aria-current={activePage === item.label ? 'page' : undefined} onClick={() => { onNavigate(item.label); onClose() }}>
               <Icon name={item.icon as IconName} size={17} />
               <span>{item.label}</span>
               {item.label === 'My roadmap' && <span className="nav-count">{roadmapCount}</span>}
@@ -110,10 +119,10 @@ function Sidebar({
             <span>{profile.projects.length} projects and {profile.certifications.length} certifications recorded.</span>
             <span className="streak-label">Keep adding milestones as you learn.</span>
           </div>
-          <button className={`nav-item settings-link ${activePage === 'Settings' ? 'nav-active' : ''}`} onClick={() => onNavigate('Settings')}>
+          <button type="button" className={`nav-item settings-link ${activePage === 'Settings' ? 'nav-active' : ''}`} aria-current={activePage === 'Settings' ? 'page' : undefined} onClick={() => onNavigate('Settings')}>
             <Icon name="settings" size={17} /><span>Settings</span>
           </button>
-          <button className="nav-item settings-link" onClick={onLogout}>Sign out</button>
+          <button type="button" className="nav-item settings-link" onClick={onLogout}>Sign out</button>
           <div className="sidebar-profile">
             <div className="avatar avatar-small">{initials}</div>
             <div className="profile-copy"><strong>{profile.name}</strong><span>Free plan</span></div>
@@ -130,7 +139,7 @@ function ProgressRing({ value }: { value: number }) {
   const circumference = 2 * Math.PI * radius
   return (
     <div className="progress-ring">
-      <svg viewBox="0 0 88 88" aria-label={`${value}% roadmap complete`}>
+      <svg role="img" viewBox="0 0 88 88" aria-label={`${value}% roadmap complete`}>
         <circle className="ring-track" cx="44" cy="44" r={radius} />
         <circle className="ring-value" cx="44" cy="44" r={radius} strokeDasharray={circumference} strokeDashoffset={circumference * (1 - value / 100)} />
       </svg>
@@ -208,7 +217,7 @@ function AgentActivityPanel({
           <li key={`${step.position}-${step.title}`}>
             <div><span>{step.title}</span><small>{step.duration} · {step.lessons} lessons</small></div>
             {step.exercises[0] && <p>Try: {step.exercises[0]}</p>}
-            {step.resources[0] && <a href={step.resources[0]} target="_blank" rel="noreferrer">Learning resource <Icon name="arrow" size={11} /></a>}
+            {step.resources[0] && safeResourceUrl(step.resources[0]) && <a href={safeResourceUrl(step.resources[0])!} target="_blank" rel="noopener noreferrer" aria-label={`Learning resource for ${step.title} (opens in a new tab)`}>Learning resource <Icon name="arrow" size={11} /></a>}
           </li>
         ))}</ol>
       </div>}
@@ -415,7 +424,6 @@ function App() {
       const result = await learnerApi.analyze(targetCareer, recordActivity)
       setAgentResult(result)
       setRoadmap(result.learning_path.steps)
-      setSkills(await learnerApi.getSkills())
       setExpandedStep(result.learning_path.steps.find((step) => step.status === 'in-progress')?.id ?? null)
     } catch (error) {
       setAgentError(error instanceof Error ? error.message : 'Agent analysis failed.')
@@ -458,7 +466,6 @@ function App() {
       const result = await learnerApi.submitAssessment(answers, career, recordActivity)
       setAssessmentResult(result)
       setRoadmap(result.updated_roadmap.steps)
-      setSkills(await learnerApi.getSkills())
       setAssessmentHistory(await learnerApi.getAssessmentHistory())
       setExpandedStep(result.updated_roadmap.steps.find((step) => step.status === 'in-progress')?.id ?? null)
     } catch (error) {

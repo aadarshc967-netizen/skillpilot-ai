@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal, TypeVar
@@ -10,8 +11,12 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 T = TypeVar("T", bound=BaseModel)
+R = TypeVar("R")
 ActivityCallback = Callable[[dict[str, Any]], None]
 logger = logging.getLogger(__name__)
+GEMINI_FALLBACK_MODEL = "gemini-3.1-flash-lite"
+GEMINI_MAX_RETRIES = 2
+GEMINI_RETRY_BASE_SECONDS = 0.5
 
 
 ASSESSMENT_QUESTIONS: list[dict[str, Any]] = [
@@ -224,6 +229,84 @@ class AgentRuntime:
                 "Unable to initialize Gemini; check backend configuration and logs."
             ) from exc
 
+    @staticmethod
+    def _provider_status_code(exc: Exception) -> int | None:
+        for value in (getattr(exc, "code", None), getattr(exc, "status_code", None)):
+            try:
+                status_code = int(value)
+            except (TypeError, ValueError):
+                continue
+            if 100 <= status_code <= 599:
+                return status_code
+        response = getattr(exc, "response", None)
+        try:
+            return int(response.status_code)
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    def _generate_with_fallback(
+        self,
+        prompt: str,
+        operation: str,
+        parse_response: Callable[[str], R],
+        config: Any | None = None,
+    ) -> R:
+        if self._client is None:
+            raise AgentProviderError("Gemini client initialization did not complete.")
+
+        models = [self.model]
+        if GEMINI_FALLBACK_MODEL != self.model:
+            models.append(GEMINI_FALLBACK_MODEL)
+
+        last_error: Exception | None = None
+        for model_index, model in enumerate(models):
+            max_retries = GEMINI_MAX_RETRIES if model_index == 0 else 0
+            for retry in range(max_retries + 1):
+                try:
+                    response = self._client.models.generate_content(
+                        model=model,
+                        contents=prompt,
+                        **({"config": config} if config is not None else {}),
+                    )
+                    if not response.text:
+                        raise AgentProviderError("Gemini returned an empty response.")
+                    return parse_response(response.text)
+                except Exception as exc:
+                    last_error = exc
+                    status_code = self._provider_status_code(exc)
+                    if status_code is not None or not isinstance(exc, AgentProviderError):
+                        self._log_provider_error(operation, exc)
+                    if (
+                        model_index == 0
+                        and status_code is not None
+                        and 500 <= status_code <= 599
+                        and retry < max_retries
+                    ):
+                        delay = GEMINI_RETRY_BASE_SECONDS * (2 ** retry)
+                        logger.warning(
+                            "Gemini %s request to model %s returned HTTP %s; retrying in %.1f seconds (retry %s/%s).",
+                            operation,
+                            model,
+                            status_code,
+                            delay,
+                            retry + 1,
+                            max_retries,
+                        )
+                        time.sleep(delay)
+                        continue
+                    break
+
+        fallback_model = models[-1] if len(models) > 1 else None
+        if fallback_model:
+            raise AgentProviderError(
+                f"Gemini {operation} request failed for configured model '{self.model}' "
+                f"and fallback model '{fallback_model}'. Please try again later; check backend logs."
+            ) from last_error
+        raise AgentProviderError(
+            f"Gemini {operation} request failed for model '{self.model}'. "
+            "Please try again later; check backend logs."
+        ) from last_error
+
     def generate(self, prompt: str, output_type: type[T]) -> T:
         if self.demo_mode:
             raise AgentProviderError("Gemini is not configured; deterministic demo mode is active.")
@@ -231,22 +314,23 @@ class AgentRuntime:
         if self._client is None or self._generate_config is None:
             raise AgentProviderError("Gemini client initialization did not complete.")
         try:
-            response = self._client.models.generate_content(
-                model=self.model,
-                contents=prompt,
-                config=self._generate_config(
-                    response_mime_type="application/json",
-                    response_schema=output_type,
-                ),
+            config = self._generate_config(
+                response_mime_type="application/json",
+                response_schema=output_type,
             )
-            if not response.text:
-                raise AgentProviderError("Gemini returned an empty response.")
-            return output_type.model_validate_json(response.text)
+            return self._generate_with_fallback(
+                prompt,
+                "agent",
+                output_type.model_validate_json,
+                config,
+            )
         except AgentProviderError:
             raise
         except Exception as exc:
-            self._log_provider_error("structured agent", exc)
-            raise AgentProviderError("Gemini agent request failed; check backend logs.") from exc
+            raise AgentProviderError(
+                f"Gemini agent request failed for configured model '{self.model}' and fallback model "
+                f"'{GEMINI_FALLBACK_MODEL}'. Please try again later; check backend logs."
+            ) from exc
 
     def generate_text(self, prompt: str) -> str:
         if self.demo_mode:
@@ -255,18 +339,18 @@ class AgentRuntime:
         if self._client is None:
             raise AgentProviderError("Gemini client initialization did not complete.")
         try:
-            response = self._client.models.generate_content(
-                model=self.model,
-                contents=prompt,
+            return self._generate_with_fallback(
+                prompt,
+                "mentor",
+                str.strip,
             )
-            if not response.text:
-                raise AgentProviderError("Gemini returned an empty response.")
-            return response.text.strip()
         except AgentProviderError:
             raise
         except Exception as exc:
-            self._log_provider_error("mentor", exc)
-            raise AgentProviderError("Gemini mentor request failed; check backend logs.") from exc
+            raise AgentProviderError(
+                f"Gemini mentor request failed for configured model '{self.model}' and fallback model "
+                f"'{GEMINI_FALLBACK_MODEL}'. Please try again later; check backend logs."
+            ) from exc
 
 
 class SkillAnalystAgent:

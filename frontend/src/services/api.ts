@@ -202,6 +202,7 @@ async function streamRequest<T>(
 }
 
 const TOKEN_STORAGE_KEY = 'skillpilot_access_token'
+let assessmentQuestionsRequest: Promise<AssessmentQuestion[]> | undefined
 
 export function getAuthToken(): string | null {
   return localStorage.getItem(TOKEN_STORAGE_KEY)
@@ -258,7 +259,14 @@ export const learnerApi = {
   updateRoadmapStatus: (stepId: number, status: RoadmapRecord['status']) =>
     request<RoadmapRecord>(`/api/roadmap/${stepId}?status=${encodeURIComponent(status)}`, { method: 'PUT' }),
   getAssessmentHistory: () => request<AssessmentAttempt[]>('/api/assessments'),
-  getAssessmentQuestions: () => request<AssessmentQuestion[]>('/api/assessment/questions'),
+  getAssessmentQuestions: () => {
+    assessmentQuestionsRequest ??= request<AssessmentQuestion[]>('/api/assessment/questions')
+      .catch((error: unknown) => {
+        assessmentQuestionsRequest = undefined
+        throw error
+      })
+    return assessmentQuestionsRequest
+  },
   analyze: (targetCareer: string, onActivity: (activity: AgentActivity) => void) =>
     streamRequest<AgentRunResult>('/api/agents/analyze', { target_career: targetCareer }, onActivity),
   submitAssessment: (

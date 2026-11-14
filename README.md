@@ -57,7 +57,7 @@ $env:GEMINI_MODEL = "gemini-3.8-flash"
 uvicorn app.main:app --reload
 ```
 
-The backend loads `GEMINI_API_KEY` from `backend/.env` or the process environment. Live Gemini errors are reported; the application does not silently switch to demo responses. To explicitly enable deterministic demo behavior for a local demonstration, set `SKILLPILOT_DEMO_MODE=true`. The UI labels those results as demo output, not live AI.
+The backend loads `GEMINI_API_KEY` from `backend/.env` or the process environment. Temporary Gemini 5xx errors are retried up to twice with exponential backoff; if the configured model still fails, requests try `gemini-3.1-flash-lite` once. If both models fail, the API reports an error and does not substitute demo responses. To explicitly enable deterministic demo behavior for a local demonstration, set `SKILLPILOT_DEMO_MODE=true`. The UI labels those results as demo output, not live AI.
 
 Learner endpoints require a bearer token returned by signup or login. Passwords are stored as salted PBKDF2 hashes. Set a persistent, securely generated `JWT_SECRET_KEY` (at least 32 characters) in the backend environment to keep tokens valid across restarts; production mode refuses to run authenticated requests without it. Never commit `.env` files, API keys, or the database.
 

@@ -593,6 +593,110 @@ def test_live_gemini_failure_does_not_activate_demo_fallback(monkeypatch: pytest
     assert runtime.fallback_reason is None
 
 
+def test_gemini_retries_temporary_failures_then_uses_structured_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key-not-used")
+    monkeypatch.setenv("SKILLPILOT_DEMO_MODE", "false")
+    delays: list[float] = []
+    monkeypatch.setattr("backend.app.agents.time.sleep", delays.append)
+
+    class TemporaryProviderFailure(Exception):
+        code = 503
+        status = "UNAVAILABLE"
+        message = "Temporarily unavailable"
+
+    class Models:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, object]]] = []
+
+        def generate_content(self, **kwargs: object):
+            model = str(kwargs["model"])
+            self.calls.append((model, kwargs))
+            if model == "configured-model":
+                raise TemporaryProviderFailure()
+            return type("Response", (), {
+                "text": '{"strengths":[],"weaknesses":[],"skill_gaps":[],"summary":"Fallback response"}'
+            })()
+
+    models = Models()
+    runtime = AgentRuntime()
+    runtime.model = "configured-model"
+    runtime._client = type("Client", (), {"models": models})()
+    runtime._generate_config = lambda **kwargs: kwargs
+    result = runtime.generate("Analyze skills", SkillAnalysis)
+
+    assert result.summary == "Fallback response"
+    assert [model for model, _kwargs in models.calls] == [
+        "configured-model",
+        "configured-model",
+        "configured-model",
+        "gemini-3.1-flash-lite",
+    ]
+    assert delays == [0.5, 1.0]
+    assert models.calls[-1][1]["config"]["response_mime_type"] == "application/json"
+    assert models.calls[-1][1]["config"]["response_schema"] is SkillAnalysis
+
+
+def test_gemini_fallback_failure_is_clear_and_does_not_expose_key(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret = "test-key-that-must-not-leak"
+    monkeypatch.setenv("GEMINI_API_KEY", secret)
+    monkeypatch.setenv("SKILLPILOT_DEMO_MODE", "false")
+
+    class ProviderFailure(Exception):
+        code = 503
+        status = "UNAVAILABLE"
+        message = "Service unavailable"
+
+    class Models:
+        def generate_content(self, **_kwargs: object):
+            raise ProviderFailure()
+
+    runtime = AgentRuntime()
+    runtime._client = type("Client", (), {"models": Models()})()
+    runtime._generate_config = lambda **kwargs: kwargs
+    with pytest.raises(
+        AgentProviderError,
+        match="configured model 'gemini-3.8-flash'.*fallback model 'gemini-3.1-flash-lite'",
+    ) as error:
+        runtime.generate("Analyze skills", SkillAnalysis)
+    assert secret not in str(error.value)
+    assert secret not in caplog.text
+
+
+def test_gemini_does_not_retry_non_server_errors_before_model_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key-not-used")
+    monkeypatch.setenv("SKILLPILOT_DEMO_MODE", "false")
+
+    class ModelNotFound(Exception):
+        code = 404
+        status = "NOT_FOUND"
+        message = "Model not found"
+
+    class Models:
+        def __init__(self) -> None:
+            self.called_models: list[str] = []
+
+        def generate_content(self, **kwargs: object):
+            model = str(kwargs["model"])
+            self.called_models.append(model)
+            if model == "configured-model":
+                raise ModelNotFound()
+            return type("Response", (), {"text": "Mentor response"})()
+
+    models = Models()
+    runtime = AgentRuntime()
+    runtime.model = "configured-model"
+    runtime._client = type("Client", (), {"models": models})()
+    assert runtime.generate_text("Help me learn") == "Mentor response"
+    assert models.called_models == ["configured-model", "gemini-3.1-flash-lite"]
+
+
 def test_missing_gemini_key_requires_explicit_demo_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
